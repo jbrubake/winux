@@ -1,0 +1,275 @@
+#!/bin/sh
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+#
+# Copyright 2024 Jeremy Brubaker <jbru362@gmail.com>
+#
+# abstract: seamless mode for a libvirt Windows VM
+#
+# Defaults {{{1
+CONFIG_DIR=$XDG_CONFIG_HOME/winux
+CFG_FILE_DFLT=$CONFIG_DIR/winux.conf
+APP_LIST_DFLT=$CONFIG_DIR/apps.rc
+
+RDP_VM=${RDP_VM:-winux}
+RDP_SCALE=100
+RDP_FLAGS=
+MULTIMON=true
+FREERDP_COMMAND=xfreerdp
+VERBOSE=
+
+tmpshare=tmp
+installed=installed.tsv
+find_apps=find-apps.ps1
+find_apps_script='$sh = New-Object -ComObject WScript.Shell
+$links = Get-ChildItem "C:\ProgramData\Microsoft\Windows\Start Menu\Programs" -Recurse -Filter "*.lnk"
+
+$table = foreach($l in $links) {
+    [PSCustomObject]@{
+        name = $l.BaseName.ToLower()
+        path = $sh.CreateShortcut($l.FullName).TargetPath
+        args = $sh.CreateShortcut($l.FullName).Arguments
+        dir  = $sh.CreateShortcut($l.FullName).WorkingDirectory
+    }
+}
+$table | Export-Csv -Delimiter "`t" -Path \\tsclient\TMPSHARE\INSTALLED -NoTypeInformation'
+# Documentation {{{1
+#
+VERSION='1.0'
+
+print_help() {
+    [ -n "$1" ] && printf "%s\n" "$1"
+    cat <<EOF
+Usage: $0 [OPTION] [COMMAND]
+
+Run Windows applications on a virtual machine in seamless mode.
+
+Options: 
+ -F [FILE]       use FILE as an alternate configuration file
+                   (Default: $CFG_FILE_DFLT)
+ -v              explain what is being done
+ -V              display version info and exit
+ -h              display this help and exit
+
+If COMMAND is an installed application, run it in seamless mode,
+ otherwise treat it as a command:
+
+ check           Verify connection with the VM and accept the certificate
+ install         Generate a list of installed applications and their paths
+ list            Print a list of installed applications
+ get [NAME]      Get the executable path for application NAME
+ run [PATH]      Run the application found at PATH
+ windows         Start an RDP session to the Windows virtual machine
+EOF
+} >&2
+
+print_version() {
+    cat <<EOF
+$PROGNAME $VERSION
+Copyright (C) 2024 Orion Arts
+License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>.
+This is free software: you are free to change and redistribute it.
+There is NO WARRANTY, to the extent permitted by law.
+
+Written by Jeremy Brubaker.
+EOF
+}
+
+# Functions {{{1
+#
+have() { command -v "$1" >/dev/null; }
+die() {
+    printf '%s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+mkdtemp() {
+    while
+        dir=$(echo 'mkstemp(template)' | m4 -D template="$1XXXXXX")
+        rm -f -- "$dir"
+        ! mkdir "$dir"
+    do : ; done
+    echo "$dir"
+}
+
+# Process options {{{1
+#
+cfg_file=$CFG_FILE_DFLT
+while getopts 'F:' opt; do
+    case $opt in
+        F) cfg_file=$OPTARG ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+[ -r "$cfg_file" ] || die "Cannot read $cfg_file"
+. "$cfg_file"
+
+app_list=$APP_LIST_DFLT
+while getopts 'a:vVh' opt; do
+    case $opt in
+        a) app_list=$OPTARG ;;
+        v) VERBOSE=y ;;
+        V) print_version; exit ;;
+        h|?) print_help; exit ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+# Check for required commands {{{2
+#
+for c in "$FREERDP_COMMAND" virsh; do
+    have "$c" || die "$c not found"
+done
+
+# Check for RDP_VM {{{2
+#
+# 0 = running
+# 1 = not running
+# 2 = not found
+virsh list --all | awk -v vm="^$RDP_VM$" '
+    BEGIN                     { ret = 2 }
+    $2 ~ vm                   { ret = 1 }
+    $2 ~ vm && $3 ~ "running" { ret = 0 }
+    END                       { exit ret }'
+
+case $? in
+    0) ;;
+    1) virsh start "$RDP_VM" ;;
+    2) die "$RDP_VM virtual machine not found" ;;
+esac
+
+# Check for and set required values {{{2
+#
+# TODO: Some of these are not needed for the list command
+[ -n "$RDP_USER" ] || die "RDP_USER not defined"
+[ -n "$RDP_PASS" ] || die "RDP_PASS not defined"
+
+[ -z "$RDP_IP" ] &&
+    RDP_IP=$(virsh domifaddr \
+             --source agent \
+             --interface 'Ethernet Instance 0' \
+             "$RDP_VM" |
+             awk '/ipv4/ { print $4 }')
+
+if [ "$MULTIMON" = "true" ]; then
+    MULTI_FLAG=/multimon
+else
+    MULTI_FLAG=+span
+fi
+
+[ -n "$RDP_FLAGS" ] && FREERDP_COMMAND="$FREERDP_COMMAND $RDP_FLAGS"
+
+tmpdir=$(mkdtemp "${TMPDIR:-/tmp}/")
+trap 'rm -f "$tmpdir"/*; rmdir "$tmpdir"; trap - EXIT; exit' EXIT INT HUP TERM
+chmod 700 "$tmpdir"
+
+mkdir -p "$(dirname "$app_list")"
+
+# Main {{{1
+#
+case $1 in
+# TODO: Add standard stuff that isn't in start like notepad
+    install)
+        echo "$find_apps_script" | sed -e "s/TMPSHARE/$tmpshare/g" \
+                                       -e "s/INSTALLED/$installed/g" \
+            > "$tmpdir/$find_apps"
+
+        # Windows ExecutionPolicy prevents running find-apps
+        printf 'powershell -ExecutionPolicy Bypass -File \\\\tsclient\%s\%s\n' \
+            "$tmpshare" \
+            "$find_apps" > "$tmpdir/run.bat"
+
+        $FREERDP_COMMAND /d:"$RDP_DOMAIN" /u:"$RDP_USER" /p:"$RDP_PASS" \
+            +auto-reconnect -wallpaper \
+            /drive:"$tmpshare","$tmpdir" \
+            $MULTI_FLAG \
+            /app:cmd.exe \
+            /app-cmd:"/c \\\\tsclient\\$tmpshare\\run.bat" \
+            /v:"$RDP_IP" 1>/dev/null 2>&1 &
+
+        c=0
+        while ! [ -f "$tmpdir/$installed" ]; do
+            sleep 5
+            c=$((c+1))
+            [ "$c" -eq 10 ] && die 'Failed to get list of installed applications'
+        done
+
+        < "$tmpdir/$installed" awk -F'\t' -v OFS='\t' '
+            NR == 1 { next }
+            {
+                $1 = gensub(/^"/, "", "1", $1)
+                $1 = gensub(/"$/, "", "1", $1)
+                $2 = gensub(/^"/, "", "1", $2)
+                $2 = gensub(/"$/, "", "1", $2)
+                $3 = gensub(/^"/, "", "1", $3)
+                $3 = gensub(/"$/, "", "1", $3)
+                $4 = gensub(/^"/, "", "1", $4)
+                $4 = gensub(/"$/, "", "1", $4)
+
+                print
+            }
+        ' > "$app_list"
+        ;;
+    list)
+        < "$app_list" awk -F'\t' '{ print gensub(/"/, "", "g", $1) }' |
+            sort
+        ;;
+    get)
+        awk -v app="$2" -F'\t' '$1 == app { print $2; exit }' \
+                "$app_list"
+        ;;
+    windows)
+        $FREERDP_COMMAND /d:"$RDP_DOMAIN" /u:"$RDP_USER" /p:"$RDP_PASS" \
+            +dynamic-resolution +auto-reconnect \
+            +home-drive \
+            /scale:$RDP_SCALE \
+            $MULTI_FLAG \
+            /wm-class:"Microsoft Windows" \
+            /v:"$RDP_IP" >/dev/null 2>&1 &
+        ;;
+    check)
+        $FREERDP_COMMAND /d:"$RDP_DOMAIN" /u:"$RDP_USER" /p:"$RDP_PASS" \
+            +dynamic-resolution +auto-reconnect \
+            /scale:$RDP_SCALE \
+            $MULTI_FLAG \
+            /wm-class:"Microsoft Windows" \
+            /v:"$RDP_IP" # Do not redirect stdout/stderr or put in background
+       ;;
+    run)
+        cmd="$2"
+        $FREERDP_COMMAND /d:"$RDP_DOMAIN" /u:"$RDP_USER" /p:"$RDP_PASS" \
+            +dynamic-resolution +auto-reconnect \
+            +home-drive \
+            /scale:$RDP_SCALE  \
+            $MULTI_FLAG \
+            /app:"$2" \
+            /wm-class:"$cmd" \
+            /v:"$RDP_IP" >/dev/null 2>&1 &
+        ;;
+    *)
+        cmd=$(awk -v app="$1" -F'\t' '$1 == app { print $2; exit }' \
+                "$app_list")
+
+        $FREERDP_COMMAND /d:"$RDP_DOMAIN" /u:"$RDP_USER" /p:"$RDP_PASS" \
+            +dynamic-resolution +auto-reconnect \
+            /scale:$RDP_SCALE  \
+            +home-drive \
+            $MULTI_FLAG \
+            /app:"$cmd" \
+            /wm-class:"$cmd" \
+            /v:"$RDP_IP" >/dev/null 2>&1 &
+        ;;
+esac
+
